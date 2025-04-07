@@ -7,6 +7,7 @@ from email.mime.text import MIMEText
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Google API scopes
 SCOPES = [
@@ -15,6 +16,7 @@ SCOPES = [
 ]
 
 def get_services():
+    """Authenticate and return Gmail and Calendar service instances."""
     creds = None
     if os.path.exists('token.json'):
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
@@ -29,51 +31,76 @@ def get_services():
     return gmail_service, calendar_service
 
 def get_unread_emails(gmail_service):
-    result = gmail_service.users().messages().list(userId='me', labelIds=['INBOX'], q='is:unread').execute()
-    messages = result.get('messages', [])
-    return messages
+    """Fetch unread emails from the inbox."""
+    try:
+        result = gmail_service.users().messages().list(userId='me', labelIds=['INBOX'], q='is:unread').execute()
+        messages = result.get('messages', [])
+        return messages
+    except HttpError as e:
+        print(f"Error fetching unread emails: {e}")
+        return []
 
 def generate_ai_reply(prompt):
+    """Generate a reply using the Ollama Mistral model."""
     command = f'echo "{prompt}" | ollama run mistral'
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
-    return result.stdout.strip()
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        output = result.stdout.strip()
+        # Remove the prompt from the output to ensure only AI-generated content is returned
+        if prompt in output:
+            output = output.split(prompt, 1)[-1].strip()
+        # Further clean up to remove any leading/trailing noise
+        output = output.split('\n', 1)[-1].strip() if '\n' in output else output
+        return output if output else "AI response unavailable due to encoding issue."
+    except subprocess.SubprocessError as e:
+        print(f"Error executing Ollama command: {e}")
+        return "AI response unavailable due to execution error."
 
-# Modified to process full email body and return CC recipients
 def process_email(gmail_service, message):
+    """Process an email and generate summary and acknowledgment replies."""
     msg_id = message['id']
-    full_msg = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-    
+    try:
+        full_msg = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
+    except HttpError as e:
+        print(f"Error retrieving email {msg_id}: {e}")
+        return "No Subject", "Unable to process email body."
+
     # Get headers
     headers = full_msg['payload']['headers']
     subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "No Subject")
-    sender_email = next((h['value'] for h in headers if h['name'] == 'From'), "")
+    sender_email = next((h['value'] for h in headers if h['name'] == 'From'), "").strip()
     cc_recipients = next((h['value'] for h in headers if h['name'] == 'Cc'), "")
     thread_id = full_msg['threadId']
     
-    # Get email body
+    # Get email body with error handling
     body = ""
-    if 'parts' in full_msg['payload']:
-        for part in full_msg['payload']['parts']:
-            if part['mimeType'] == 'text/plain':
-                body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-                break
-    else:
-        body = base64.urlsafe_b64decode(full_msg['payload']['body']['data']).decode('utf-8')
+    try:
+        if 'parts' in full_msg['payload']:
+            for part in full_msg['payload']['parts']:
+                if part['mimeType'] == 'text/plain':
+                    body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
+                    break
+        else:
+            body = base64.urlsafe_b64decode(full_msg['payload']['body']['data']).decode('utf-8', errors='replace')
+    except Exception as e:
+        print(f"Error decoding email body for message {msg_id}: {e}")
+        body = "Unable to decode email body."
 
-    # 1. Summary for self using body
-    summary_prompt = f"Summarize this email content in bullet points:\nContent: {body}"
+    # Improved summary prompt
+    summary_prompt = f"Provide a concise summary of the email content in bullet points. Exclude the input text from the response.\n{body}"
     summary_reply = generate_ai_reply(summary_prompt)
-    send_thread_reply(gmail_service, thread_id, sender_email, subject, summary_reply, cc_recipients, to_self=True)
-
-    # 2. Acknowledgment for all using body
-    ack_prompt = f"Generate a polite acknowledgment for this email content: {body}"
+    
+    # Improved acknowledgment prompt
+    ack_prompt = f"Provide a polite acknowledgment for the email content on behalf of the owner. Exclude the input text from the response.\n{body}"
     ack_reply = generate_ai_reply(ack_prompt) + "\n\nThis is an AI-generated response. The owner will reply soon when available."
+    
+    send_thread_reply(gmail_service, thread_id, sender_email, subject, summary_reply, cc_recipients, to_self=True)
     send_thread_reply(gmail_service, thread_id, sender_email, subject, ack_reply, cc_recipients, to_self=False)
 
     return subject, body
 
-# Modified to handle CC recipients
 def send_thread_reply(gmail_service, thread_id, sender, subject, text, cc_recipients, to_self=False):
+    """Send a reply email within the thread."""
     user_profile = gmail_service.users().getProfile(userId='me').execute()
     my_email = user_profile['emailAddress']
     
@@ -82,12 +109,19 @@ def send_thread_reply(gmail_service, thread_id, sender, subject, text, cc_recipi
     if to_self:
         mime_msg['to'] = my_email
     else:
+        # Validate sender_email
+        if not sender or not sender.strip():
+            print(f"Warning: No valid sender email found for thread {thread_id}. Skipping send.")
+            return
         # Reply to all: sender + CC recipients
-        recipients = [sender]
+        recipients = [sender.strip()]
         if cc_recipients:
             recipients.extend(cc_recipients.split(','))
         # Remove my email from recipients if present to avoid self-CC
-        recipients = [r.strip() for r in recipients if r.strip() != my_email]
+        recipients = [r.strip() for r in recipients if r.strip() and r.strip() != my_email]
+        if not recipients:
+            print(f"Warning: No valid recipients for thread {thread_id}. Skipping send.")
+            return
         mime_msg['to'] = ', '.join(recipients)
         if cc_recipients:
             mime_msg['cc'] = cc_recipients
@@ -96,13 +130,17 @@ def send_thread_reply(gmail_service, thread_id, sender, subject, text, cc_recipi
     
     raw_msg = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
     body = {'raw': raw_msg, 'threadId': thread_id}
-    gmail_service.users().messages().send(userId='me', body=body).execute()
+    try:
+        gmail_service.users().messages().send(userId='me', body=body).execute()
+    except HttpError as e:
+        print(f"Error sending email for thread {thread_id}: {e}")
 
 def extract_event_time(text):
-    dt = dateparser.parse(text)
-    return dt
+    """Extract date/time from email text."""
+    return dateparser.parse(text)
 
 def create_calendar_event(calendar_service, summary, start_time):
+    """Create a calendar event if a valid start time is provided."""
     if not start_time:
         return False
 
@@ -114,10 +152,15 @@ def create_calendar_event(calendar_service, summary, start_time):
         'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Kolkata'},
     }
 
-    calendar_service.events().insert(calendarId='primary', body=event).execute()
-    return True
+    try:
+        calendar_service.events().insert(calendarId='primary', body=event).execute()
+        return True
+    except HttpError as e:
+        print(f"Error creating calendar event: {e}")
+        return False
 
 def main():
+    """Main function to process unread emails."""
     gmail_service, calendar_service = get_services()
     unread_msgs = get_unread_emails(gmail_service)
     print(f"📨 Found {len(unread_msgs)} unread emails.")
@@ -126,7 +169,10 @@ def main():
         subject, body = process_email(gmail_service, msg)
         start_time = extract_event_time(body)
         create_calendar_event(calendar_service, f"Meeting: {subject}", start_time)
-        gmail_service.users().messages().modify(userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}).execute()
+        try:
+            gmail_service.users().messages().modify(userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}).execute()
+        except HttpError as e:
+            print(f"Error marking email as read for message {msg['id']}: {e}")
 
 if __name__ == '__main__':
     main()
