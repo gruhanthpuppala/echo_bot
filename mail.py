@@ -41,17 +41,21 @@ def get_unread_emails(gmail_service):
         return []
 
 def generate_ai_reply(prompt):
-    """Generate a reply using the Ollama Mistral model."""
+    """Generate a reply using the Ollama Mistral model, extracting only the AI-generated content."""
     command = f'echo "{prompt}" | ollama run mistral'
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8', errors='replace')
         output = result.stdout.strip()
-        # Remove the prompt from the output to ensure only AI-generated content is returned
+        
+        # Improved parsing: Assume AI response starts after the first newline or prompt
         if prompt in output:
+            # Split by prompt and take the part after it
             output = output.split(prompt, 1)[-1].strip()
-        # Further clean up to remove any leading/trailing noise
-        output = output.split('\n', 1)[-1].strip() if '\n' in output else output
-        return output if output else "AI response unavailable due to encoding issue."
+        # Further clean up: Take content after the first newline to skip any preamble
+        if '\n' in output:
+            output = output.split('\n', 1)[-1].strip()
+        # Return only non-empty content, otherwise fallback
+        return output if output and not output.startswith("Provide") else "AI response unavailable."
     except subprocess.SubprocessError as e:
         print(f"Error executing Ollama command: {e}")
         return "AI response unavailable due to execution error."
@@ -86,12 +90,12 @@ def process_email(gmail_service, message):
         print(f"Error decoding email body for message {msg_id}: {e}")
         body = "Unable to decode email body."
 
-    # Improved summary prompt
-    summary_prompt = f"Provide a concise summary of the email content in bullet points. Exclude the input text from the response.\n{body}"
+    # Refined summary prompt
+    summary_prompt = f"###START###\nOutput only a concise summary of the email content in bullet points.\n###END###\n{body}"
     summary_reply = generate_ai_reply(summary_prompt)
     
-    # Improved acknowledgment prompt
-    ack_prompt = f"Provide a polite acknowledgment for the email content on behalf of the owner. Exclude the input text from the response.\n{body}"
+    # Refined acknowledgment prompt
+    ack_prompt = f"###START###\nOutput only a polite acknowledgment for the email content on behalf of the owner.\n###END###\n{body}"
     ack_reply = generate_ai_reply(ack_prompt) + "\n\nThis is an AI-generated response. The owner will reply soon when available."
     
     send_thread_reply(gmail_service, thread_id, sender_email, subject, summary_reply, cc_recipients, to_self=True)
