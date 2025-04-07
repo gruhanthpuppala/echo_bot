@@ -91,7 +91,7 @@ def process_email(gmail_service, message):
         body = "Unable to decode email body."
 
     # Refined summary prompt
-    summary_prompt = f"###START###\nOutput only a concise summary of the email content in bullet points.\n###END###\n{body}"
+    summary_prompt = f"###START###\nOutput only a concise summary of the email content.\n###END###\n{body}"
     summary_reply = generate_ai_reply(summary_prompt)
     
     # Refined acknowledgment prompt
